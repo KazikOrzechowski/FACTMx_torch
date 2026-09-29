@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use FACTMx in research, please cite the associated software and publication once final citation metadata is available."
+title: "FACTMx PyTorch"
+type: software
+authors:
+  - name: "FACTMx contributors"
+version: 0.1.0
+date-released: 2026-09-29
+license: MIT
+abstract: "Generic PyTorch implementation of the FACTMx multimodal latent-variable model."
