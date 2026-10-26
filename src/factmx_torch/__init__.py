@@ -12,6 +12,7 @@ from .heads import (
     TopicModelHead,
     build_head,
 )
+from .initialization import initialize_global_covariance
 from .missing_view import MissingViewFACTMx
 from .model import FACTMxModel
 from .training import (
@@ -28,6 +29,7 @@ __all__ = [
     "__version__",
     "FACTMxModel",
     "MissingViewFACTMx",
+    "initialize_global_covariance",
     "BaseHead",
     "BernoulliHead",
     "MultinomialHead",

@@ -155,6 +155,38 @@ class FACTMxModel(nn.Module):
         latent, _, _, _ = self.infer(data, deterministic=deterministic)
         return self.decode(latent, data)
 
+    def initialize_global_covariance(
+        self,
+        data: Sequence[Any],
+        *,
+        population_gate_probs: Mapping[str, Any] | None = None,
+        simple_head_names: Sequence[str] | None = None,
+        active_head_names: Sequence[str] | None = None,
+        ridge_alpha: float = 1e-4,
+    ) -> dict[str, Any]:
+        """Apply the recommended train-only global-covariance warm start.
+
+        The initializer uses deterministic view-local summaries from ``data``,
+        block-balances them, initializes the shared linear latent-mean map from
+        whitened global covariance directions, ridge-initializes compatible
+        simple decoders, and initializes structured gates with zero latent slopes
+        plus population-logit biases.
+
+        Explicit ``population_gate_probs`` are used when supplied.  Otherwise
+        structured population proportions are estimated from deterministic local
+        assignments on the same training data.
+        """
+        from .initialization import initialize_global_covariance
+
+        return initialize_global_covariance(
+            self,
+            data,
+            population_gate_probs=population_gate_probs,
+            simple_head_names=simple_head_names,
+            active_head_names=active_head_names,
+            ridge_alpha=ridge_alpha,
+        )
+
     def fit(
         self,
         data: Sequence[Any],
@@ -216,6 +248,11 @@ class FACTMxModel(nn.Module):
         balance_min_simple_multiplier: float = 0.02,
         balance_max_simple_multiplier: float = 1.0,
         balance_target_gradient_ratio: float = 1.0,
+        initialization: str | None = "global_covariance",
+        initialization_ridge_alpha: float = 1e-4,
+        population_gate_probs: Mapping[str, Any] | None = None,
+        simple_head_names: Sequence[str] | None = None,
+        active_head_names: Sequence[str] | None = None,
         temperature_update: float | None = None,
         min_temperature: float = 1e-2,
         max_grad_norm: float | None = 10.0,
@@ -223,8 +260,11 @@ class FACTMxModel(nn.Module):
     ) -> dict[str, Any]:
         """Train with structured-first warm-up and encoder-gradient balancing.
 
-        This is the recommended observed-data-only optimization path.  The
-        legacy :meth:`fit` method is intentionally retained unchanged for
+        This is the recommended observed-data-only optimization path.  By
+        default it first applies the block-balanced global-covariance warm start
+        unless the model has already been initialized that way.  Pass
+        ``initialization="legacy"`` (or ``None``) to preserve existing parameters.
+        The legacy :meth:`fit` method is intentionally retained unchanged for
         backwards compatibility.
 
         Gradient balancing compares the *scaled* simple-view and structured-view
@@ -233,6 +273,26 @@ class FACTMxModel(nn.Module):
         coefficient for the remaining minibatches.  The EMA decay is corrected
         for the number of minibatches between updates.
         """
+        init_mode = "none" if initialization is None else str(initialization).lower()
+        initialization_info = getattr(self, "_initialization_info", None)
+        if init_mode in {"global_covariance", "covariance", "default"}:
+            if not bool(getattr(self, "_global_covariance_initialized", False)):
+                initialization_info = self.initialize_global_covariance(
+                    data,
+                    population_gate_probs=population_gate_probs,
+                    simple_head_names=simple_head_names,
+                    active_head_names=active_head_names,
+                    ridge_alpha=float(initialization_ridge_alpha),
+                )
+        elif init_mode not in {"none", "legacy", "preserve"}:
+            raise ValueError(
+                "initialization must be 'global_covariance', 'legacy'/'preserve', or None"
+            )
+        elif initialization_info is None:
+            initialization_info = {
+                "method": "legacy" if init_mode == "legacy" else "preserve"
+            }
+
         n = data[0].shape[0] if isinstance(data[0], Tensor) else data[0][0].shape[0]
         if n <= 0:
             raise ValueError("Cannot fit FACTMx on an empty dataset")
@@ -324,6 +384,7 @@ class FACTMxModel(nn.Module):
 
         return {
             "history": history,
+            "initialization": initialization_info,
             "balance_updates": int(balancer.balance_updates),
             "balance_ema_decay": float(balancer.ema_decay),
             "final_adaptive_simple_multiplier": float(balancer.current_adaptive_multiplier),
@@ -344,6 +405,7 @@ class FACTMxModel(nn.Module):
 
     def save_checkpoint(self, path: str) -> None:
         payload = self._checkpoint_config()
+        payload["initialization_info"] = getattr(self, "_initialization_info", None)
         payload["state_dict"] = self.state_dict()
         torch.save(payload, path)
 
@@ -351,6 +413,11 @@ class FACTMxModel(nn.Module):
     def load_checkpoint(cls, path: str, map_location: str | torch.device = "cpu") -> "FACTMxModel":
         payload = torch.load(path, map_location=map_location, weights_only=False)
         state = payload.pop("state_dict")
+        initialization_info = payload.pop("initialization_info", None)
         model = cls(**payload)
         model.load_state_dict(state)
+        if initialization_info is not None:
+            model._initialization_info = initialization_info
+            if initialization_info.get("method") == "global_covariance":
+                model._global_covariance_initialized = True
         return model

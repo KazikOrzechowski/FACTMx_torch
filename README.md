@@ -6,6 +6,11 @@ The implementation supports simple Bernoulli, multinomial, and multivariate-Norm
 
 > **Research software:** this package is intended for methodological research. Validate modeling assumptions, preprocessing, and evaluation procedures for each application.
 
+## Default global-covariance initialization
+
+`FACTMxModel.fit_optimized()` now applies a train-only block-balanced global-covariance warm start by default. It initializes the shared linear latent map from whitened covariance directions, ridge-initializes compatible continuous simple-view decoders, and starts structured latent-to-gate maps at zero slope with population-logit biases. Pass explicit `population_gate_probs` when independent GMM/topic weights are available; otherwise population proportions are estimated from deterministic local assignments. Use `initialization="legacy"` (or `None`) to preserve the historical parameter initialization. See `docs/global_covariance_initialization.md`.
+
+
 ## Installation
 
 FACTMx supports Python 3.10–3.12 and current PyTorch 2.x releases.
