@@ -4,7 +4,7 @@ title: "FACTMx PyTorch"
 type: software
 authors:
   - name: "FACTMx contributors"
-version: 0.1.0
-date-released: 2026-09-29
+version: 0.1.2
+date-released: 2026-10-26
 license: MIT
 abstract: "Generic PyTorch implementation of the FACTMx multimodal latent-variable model."

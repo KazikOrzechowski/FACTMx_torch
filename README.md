@@ -2,9 +2,61 @@
 
 FACTMx is a multimodal latent-variable model for learning a shared patient/sample representation while allowing individual views to use observation models suited to their data structure. This repository contains the generic PyTorch implementation only: cohort-specific analyses, comparator runners, and manuscript pipelines are intentionally kept outside the package.
 
-The implementation supports simple Bernoulli, multinomial, and multivariate-Normal views; structured Gaussian-mixture and topic-model views; contextual structured gates; optional Deep Sets context encoders; structured-first encoder-gradient-balanced training; and neutral missing-view inference.
+The implementation supports simple Bernoulli, multinomial, and multivariate-Normal views; structured Gaussian-mixture, topic-model, and regularized raw-count ZINB-mixture views; contextual structured gates; optional Deep Sets context encoders; structured-first encoder-gradient-balanced training; and neutral missing-view inference.
 
 > **Research software:** this package is intended for methodological research. Validate modeling assumptions, preprocessing, and evaluation procedures for each application.
+
+
+## Raw-count NB / ZINB structured mixture (new in 0.1.2)
+
+`ZINBMixtureHead` is an optional structured view for **per-cell raw UMI counts**.
+It uses a patient-latent mixture gate and component-by-gene NB means, with
+**gene-shared NB dispersion**, per-cell library-size offsets, and centered,
+shrinkage-regularized gene-by-sequencing-library emission offsets. Optional
+zero-inflation has nested levels: `"none"`, `"gene"`, or
+`"gene_component"` (shrunken component deviations). Exact `logsumexp`
+marginalization is used for the cell-component mixture.
+
+The structured input is one tuple per view:
+
+```python
+# Each tensor must use the same patient/cell order.
+# counts:       [patients, cells, selected_genes] raw integer UMI counts
+# size_factors: [patients, cells] measured from FULL raw gene counts,
+#               divided by a training-chosen reference depth (around 1)
+# library_ids:  [patients, cells] zero-based technical sequencing library IDs
+rna_view = (counts.float(), size_factors.float(), library_ids.long())
+
+model = FACTMxModel(
+    dim_latent=8,
+    heads_config=[{
+        "head_type": "ZINBMixture", "head_name": "rna_cells",
+        "dim": 15, "dim_genes": counts.shape[-1],
+        "n_libraries": 14,
+        "inflation": "gene_component",  # maximum enabled complexity
+        "initial_inflation": "none",   # train NB first
+        "assignment_estimator": "mean",
+        "objective": "marginal",
+    }],
+)
+head = model.heads[0]
+head.initialize_from_counts(rna_view, seed=42)  # training patients only
+model.fit([rna_view], epochs=10, batch_size=8)
+head.set_inflation_mode("gene")
+model.fit([rna_view], epochs=5, batch_size=8, lr=3e-4)
+# Only if held-out predictions justify more complex inflation:
+# head.set_inflation_mode("gene_component")
+```
+
+Use raw counts, **never** `exp(log-normalized-X) - 1`. The library covariate
+is an emission adjustment, not a patient gate input; the local encoder also
+uses the estimated emission offsets to correct its count summaries. The model expects a
+fixed-size sampled cell set per patient, does not implement padded-cell masks,
+and intentionally does not infer size factors from the HVG subset.
+The count initializer and its gate proportions must use the **training fold only**.
+Full details, identifiability warnings, input preparation, and examples are in
+[`docs/zinb_mixture.md`](docs/zinb_mixture.md) and
+[`examples/zinb_mixture_training.py`](examples/zinb_mixture_training.py).
 
 ## Default global-covariance initialization
 

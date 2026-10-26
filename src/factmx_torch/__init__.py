@@ -10,6 +10,7 @@ from .heads import (
     MultinomialHead,
     StructuredMixtureHead,
     TopicModelHead,
+    ZINBMixtureHead,
     build_head,
 )
 from .initialization import initialize_global_covariance
@@ -37,6 +38,7 @@ __all__ = [
     "StructuredMixtureHead",
     "GMMHead",
     "TopicModelHead",
+    "ZINBMixtureHead",
     "build_head",
     "LinearEncoder",
     "MeanEncoder",

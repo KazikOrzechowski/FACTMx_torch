@@ -361,12 +361,12 @@ class StructuredMixtureHead(BaseHead):
         n_steps = self.contextual_steps if steps is None else int(steps)
         if kappa < 0:
             raise ValueError("prior_strength must be non-negative")
-        if n_steps <= 0 or context_data.shape[1] == 0:
+        if n_steps <= 0 or (context_data[0] if isinstance(context_data, (tuple, list)) else context_data).shape[1] == 0:
             return prior
 
         component_ll = self.component_log_likelihood(context_data)
         gate = prior
-        n_context = float(context_data.shape[1])
+        n_context = float(context_data[0].shape[1] if isinstance(context_data, (tuple, list)) else context_data.shape[1])
         for _ in range(n_steps):
             log_gate = gate.clamp_min(1e-12).log()
             responsibilities = F.softmax(log_gate.unsqueeze(1) + component_ll, dim=-1)
@@ -647,6 +647,369 @@ class TopicModelHead(StructuredMixtureHead):
         return torch.matmul(data, self.log_topic_profiles())
 
 
+
+class ZINBMixtureHead(StructuredMixtureHead):
+    """Count mixture with NB / gene-ZINB / hierarchical gene-component ZINB.
+
+    One structured view is a tuple of patient-batched tensors:
+
+    * raw UMI counts ``[patients, cells, genes]`` (float tensor of integers);
+    * **external**, full-transcriptome size factors ``[patients, cells]``,
+      normalized to a reference depth (typical value near 1);
+    * integer technical-library indices ``[patients, cells]`` in
+      ``0 .. n_libraries-1``. This third item is optional for one library.
+
+    Every library uses the same genes in the same order. No library covariate
+    enters the patient mixture gate. An emission offset is mean-centered across
+    libraries for identifiability and L2-shrunk to zero. The head assumes a
+    fixed number of sampled cells per patient (no padded-cell mask).
+
+    ``inflation`` specifies the *maximum supported* model, while
+    :meth:`set_inflation_mode` selects the active nested submodel. The active
+    setting is a buffer and survives state_dict/checkpoint round-trips.
+    """
+
+    head_type = "ZINBMixture"
+    _INFLATION_LEVELS = {"none": 0, "gene": 1, "gene_component": 2}
+
+    def __init__(
+        self,
+        dim: int,
+        dim_latent: int,
+        dim_genes: int,
+        head_name: str,
+        n_libraries: int = 1,
+        inflation: str = "gene",
+        initial_inflation: str | None = None,
+        initial_pi: float = 0.01,
+        initial_dispersion: float = 10.0,
+        min_dispersion: float = 1e-2,
+        max_dispersion: float = 1e4,
+        component_inflation_sd: float = 0.35,
+        component_inflation_penalty: float = 1.0,
+        gene_inflation_prior_strength: float = 0.05,
+        gene_inflation_prior_beta: float = 20.0,
+        dispersion_prior_strength: float = 0.01,
+        batch_effect_sd: float = 0.25,
+        batch_effect_penalty: float = 1.0,
+        normalize_by_genes: bool = False,
+        validate_counts: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        # Exact marginalization over whole-cell mixture components is essential:
+        # a nearly hard Gumbel estimator would make ZINB fitting very unstable.
+        if kwargs.pop("objective", "marginal") != "marginal":
+            raise ValueError("ZINBMixture requires objective='marginal'")
+        # Unlike the legacy structured heads, avoid almost-hard Gumbel draws
+        # at the default temperature in the local patient-encoder summary.
+        kwargs.setdefault("assignment_estimator", "mean")
+        super().__init__(dim, dim_latent, head_name, objective="marginal", **kwargs)
+        if dim_genes <= 0 or n_libraries <= 0:
+            raise ValueError("dim_genes and n_libraries must be positive")
+        if inflation not in self._INFLATION_LEVELS:
+            raise ValueError("inflation must be 'none', 'gene' or 'gene_component'")
+        if not (0 < initial_pi < 1):
+            raise ValueError("initial_pi must lie in (0, 1)")
+        if not (0 < min_dispersion < initial_dispersion < max_dispersion):
+            raise ValueError("dispersion bounds must contain initial_dispersion")
+        if component_inflation_sd <= 0 or batch_effect_sd <= 0:
+            raise ValueError("regularization standard deviations must be positive")
+        if (component_inflation_penalty < 0 or batch_effect_penalty < 0
+                or gene_inflation_prior_strength < 0 or dispersion_prior_strength < 0):
+            raise ValueError("regularization strengths must be non-negative")
+        if gene_inflation_prior_beta < 1:
+            raise ValueError("gene_inflation_prior_beta must be >= 1")
+        self.dim_genes = int(dim_genes)
+        self.n_libraries = int(n_libraries)
+        self.max_inflation = inflation
+        self.min_dispersion = float(min_dispersion)
+        self.max_dispersion = float(max_dispersion)
+        self.component_inflation_sd = float(component_inflation_sd)
+        self.component_inflation_penalty = float(component_inflation_penalty)
+        self.gene_inflation_prior_strength = float(gene_inflation_prior_strength)
+        self.gene_inflation_prior_beta = float(gene_inflation_prior_beta)
+        self.dispersion_prior_strength = float(dispersion_prior_strength)
+        self.initial_dispersion = float(initial_dispersion)
+        self.batch_effect_sd = float(batch_effect_sd)
+        self.batch_effect_penalty = float(batch_effect_penalty)
+        self.normalize_by_genes = bool(normalize_by_genes)
+        self.validate_counts = bool(validate_counts)
+        self.log_component_mean = nn.Parameter(torch.zeros(dim, dim_genes))
+        dispersion_raw = math.log(math.expm1(initial_dispersion))
+        self.raw_dispersion = nn.Parameter(torch.full((dim_genes,), dispersion_raw))
+        pi_logits = math.log(initial_pi / (1.0 - initial_pi))
+        self.gene_inflation_logits = (
+            nn.Parameter(torch.full((dim_genes,), pi_logits))
+            if self._INFLATION_LEVELS[inflation] >= 1 else None
+        )
+        self.component_inflation_deviations = (
+            nn.Parameter(torch.zeros(dim, dim_genes))
+            if inflation == "gene_component" else None
+        )
+        self.batch_log_effects = (
+            nn.Parameter(torch.zeros(n_libraries, dim_genes))
+            if n_libraries > 1 else None
+        )
+        self.encoder_classifier = nn.Linear(dim_genes, dim)
+        nn.init.zeros_(self.encoder_classifier.bias)
+        self._build_context_encoder(dim_genes)
+        self.register_buffer("_inflation_level", torch.zeros((), dtype=torch.long))
+        self.set_inflation_mode(initial_inflation or inflation)
+
+    @property
+    def inflation_mode(self) -> str:
+        level = int(self._inflation_level.item())
+        return next(name for name, number in self._INFLATION_LEVELS.items() if number == level)
+
+    def set_inflation_mode(self, mode: str) -> None:
+        """Switch from NB warm start to gene or hierarchical ZINB in-place."""
+        if mode not in self._INFLATION_LEVELS:
+            raise ValueError(f"Unknown inflation mode: {mode}")
+        if self._INFLATION_LEVELS[mode] > self._INFLATION_LEVELS[self.max_inflation]:
+            raise ValueError(f"{mode} exceeds configured maximum {self.max_inflation}")
+        self._inflation_level.fill_(self._INFLATION_LEVELS[mode])
+
+    def unpack_data(self, data: Any) -> tuple[Tensor, Tensor, Tensor]:
+        if not isinstance(data, (tuple, list)) or len(data) not in (2, 3):
+            raise ValueError(
+                "ZINBMixture data must be (raw_counts, full_count_size_factors, library_ids)"
+            )
+        counts, size_factors = data[:2]
+        if not isinstance(counts, Tensor) or counts.ndim != 3 or counts.shape[-1] != self.dim_genes:
+            raise ValueError("counts must have shape [patients, cells, dim_genes]")
+        if counts.shape[1] == 0:
+            raise ValueError("ZINBMixture requires at least one actual cell per patient")
+        if not counts.is_floating_point():
+            counts = counts.to(torch.float32)
+        if not isinstance(size_factors, Tensor):
+            raise TypeError("size_factors must be a Tensor")
+        if size_factors.ndim == 3 and size_factors.shape[-1] == 1:
+            size_factors = size_factors[..., 0]
+        if size_factors.shape != counts.shape[:2]:
+            raise ValueError("size_factors must have shape [patients, cells]")
+        size_factors = size_factors.to(device=counts.device, dtype=counts.dtype)
+        if len(data) == 3:
+            library_ids = data[2]
+            if not isinstance(library_ids, Tensor) or library_ids.shape != counts.shape[:2]:
+                raise ValueError("library_ids must have shape [patients, cells]")
+            if library_ids.is_floating_point():
+                if not torch.all(library_ids == library_ids.round()):
+                    raise ValueError("library_ids must contain integer indices")
+            library_ids = library_ids.to(device=counts.device, dtype=torch.long)
+        else:
+            if self.n_libraries != 1:
+                raise ValueError("library_ids are required with n_libraries > 1")
+            library_ids = torch.zeros(counts.shape[:2], dtype=torch.long, device=counts.device)
+        if self.validate_counts:
+            if not torch.all(torch.isfinite(counts)) or torch.any(counts < 0):
+                raise ValueError("counts must be finite and non-negative")
+            if not torch.all(counts == counts.round()):
+                raise ValueError("counts must be *raw integer UMI counts*, not normalized data")
+        if not torch.all(torch.isfinite(size_factors)) or torch.any(size_factors <= 0):
+            raise ValueError("size_factors must be finite and strictly positive")
+        if torch.any(library_ids < 0) or torch.any(library_ids >= self.n_libraries):
+            raise ValueError("library_ids outside the configured library range")
+        return counts, size_factors, library_ids
+
+    def context_encoder_input(self, context_data: Any) -> Tensor:
+        counts, size_factors, library_ids = self.unpack_data(context_data)
+        # Emission-estimated gene/library technical shifts must also be removed
+        # from the *local encoder* summary, otherwise the patient posterior can
+        # absorb batch despite a corrected emission model. Detach offsets here
+        # so the encoder cannot train technical offsets simply to help itself.
+        correction = self.batch_effects()[library_ids].detach().clamp(-8.0, 8.0)
+        corrected_rate = counts / size_factors.unsqueeze(-1) * torch.exp(-correction)
+        return torch.log1p(corrected_rate)
+
+    def local_assignment_logits(self, data: Any) -> Tensor:
+        return self.encoder_classifier(self.context_encoder_input(data))
+
+    def dispersion(self) -> Tensor:
+        return F.softplus(self.raw_dispersion).clamp(self.min_dispersion, self.max_dispersion)
+
+    def batch_effects(self) -> Tensor:
+        if self.batch_log_effects is None:
+            return self.log_component_mean.new_zeros((1, self.dim_genes))
+        return self.batch_log_effects - self.batch_log_effects.mean(dim=0, keepdim=True)
+
+    def inflation_logits(self) -> Tensor | None:
+        if self.inflation_mode == "none":
+            return None
+        assert self.gene_inflation_logits is not None
+        logits = self.gene_inflation_logits.unsqueeze(0).expand(self.dim, -1)
+        if self.inflation_mode == "gene_component":
+            assert self.component_inflation_deviations is not None
+            # Across-component centering removes a redundant additive intercept.
+            deviations = self.component_inflation_deviations
+            logits = logits + deviations - deviations.mean(dim=0, keepdim=True)
+        return logits
+
+    def component_log_likelihood(self, data: Any) -> Tensor:
+        """Exact per-cell log p(count-vector | component), [N,C,K]."""
+        counts, size_factors, library_ids = self.unpack_data(data)
+        x = counts.unsqueeze(-2)  # [patients, cells, 1, genes]
+        log_mu = (
+            size_factors.log().unsqueeze(-1).unsqueeze(-1)
+            + self.log_component_mean[None, None, :, :]
+            + self.batch_effects()[library_ids].unsqueeze(-2)
+        )
+        # Bound exponentiation only, preserving finite values at extreme depths.
+        mu = torch.exp(log_mu.clamp(-18.0, 18.0))
+        theta = self.dispersion()
+        log_theta = theta.log()
+        log_theta_mu = torch.log(theta + mu)
+        log_nb = (
+            torch.lgamma(x + theta) - torch.lgamma(theta) - torch.lgamma(x + 1.0)
+            + theta * (log_theta - log_theta_mu)
+            + x * (log_mu.clamp(-18.0, 18.0) - log_theta_mu)
+        )
+        inflation = self.inflation_logits()
+        if inflation is not None:
+            logits = inflation[None, None, :, :]
+            log_pi = F.logsigmoid(logits)
+            log_no_pi = F.logsigmoid(-logits)
+            log_nb_zero = theta * (log_theta - log_theta_mu)
+            log_zero = torch.logaddexp(log_pi, log_no_pi + log_nb_zero)
+            log_nb = torch.where(x == 0, log_zero, log_no_pi + log_nb)
+        result = log_nb.sum(dim=-1)
+        if self.normalize_by_genes:
+            result = result / self.dim_genes
+        return result
+
+    def regularization_loss(self) -> Tensor:
+        result = self.log_component_mean.new_zeros(())
+        # Weak log-dispersion shrinkage mitigates competition between low theta
+        # and large pi when observed zeros do not identify them separately.
+        if self.dispersion_prior_strength > 0:
+            result = result + (
+                self.dispersion_prior_strength
+                * (self.dispersion().log() - math.log(self.initial_dispersion)).square().mean()
+            )
+        # A weak Beta(1, beta) prior discourages unjustified extra zeros.
+        if self.inflation_mode != "none" and self.gene_inflation_prior_strength > 0:
+            assert self.gene_inflation_logits is not None
+            result = result + (
+                self.gene_inflation_prior_strength * (self.gene_inflation_prior_beta - 1)
+                * F.softplus(self.gene_inflation_logits).mean()
+            )
+        if self.batch_log_effects is not None and self.batch_effect_penalty > 0:
+            result = result + (
+                self.batch_effect_penalty / (2 * self.batch_effect_sd**2)
+                * self.batch_effects().square().mean()
+            )
+        if self.inflation_mode == "gene_component" and self.component_inflation_penalty > 0:
+            deviations = self.component_inflation_deviations
+            assert deviations is not None
+            centered = deviations - deviations.mean(dim=0, keepdim=True)
+            result = result + (
+                self.component_inflation_penalty / (2 * self.component_inflation_sd**2)
+                * centered.square().mean()
+            )
+        return result
+
+    def loss(self, data: Any, latent: Tensor, encoded: Mapping[str, Tensor]) -> Tensor:
+        return super().loss(data, latent, encoded) + self.regularization_loss()
+
+    @torch.no_grad()
+    def initialize_from_counts(
+        self,
+        data: Any,
+        assignments: Tensor | None = None,
+        *,
+        max_init_cells: int = 5000,
+        kmeans_iterations: int = 10,
+        seed: int = 0,
+        prior_exposure: float = 2.0,
+        gate_from_assignments: bool = True,
+    ) -> dict[str, Any]:
+        """Observed training-count initialization (no held-out data or labels).
+
+        Optionally accept training-only cell responsibilities ``[N,C,K]``.
+        Otherwise run a small, seeded torch k-means on subsampled normalized
+        log-counts. The resulting component mean profiles are exposure-weighted.
+        NB dispersion remains at its configured stable initial value; refine it
+        during training, rather than fitting a poorly identified ZINB moment model.
+        """
+        counts, sf, _ = self.unpack_data(data)
+        x = counts.reshape(-1, self.dim_genes)
+        exposure = sf.reshape(-1)
+        n_cells = int(x.shape[0])
+        if n_cells < self.dim:
+            raise ValueError("Need at least as many training cells as components")
+        if max_init_cells < self.dim or kmeans_iterations < 1 or prior_exposure <= 0:
+            raise ValueError("max_init_cells>=components, iterations>=1, prior_exposure>0 required")
+        generator = torch.Generator(device=x.device).manual_seed(seed)
+        ids = torch.randperm(n_cells, generator=generator, device=x.device)[:max_init_cells]
+        sample_x = x[ids]
+        sample_sf = exposure[ids]
+        features = torch.log1p(sample_x / sample_sf[:, None])
+        if assignments is None:
+            centers = features[torch.randperm(len(ids), generator=generator, device=x.device)[:self.dim]].clone()
+            for _ in range(kmeans_iterations):
+                distances = torch.cdist(features[None], centers[None]).squeeze(0)
+                labels = distances.argmin(dim=-1)
+                for k in range(self.dim):
+                    selected = labels == k
+                    if selected.any():
+                        centers[k] = features[selected].mean(dim=0)
+            responsibilities = F.one_hot(labels, self.dim).to(sample_x.dtype)
+        else:
+            if assignments.shape != (*counts.shape[:2], self.dim):
+                raise ValueError("assignments must be [patients, cells, components]")
+            responsibilities = assignments.reshape(-1, self.dim)[ids].to(sample_x.dtype)
+            if (not torch.all(torch.isfinite(responsibilities))
+                    or torch.any(responsibilities < 0)
+                    or torch.any(responsibilities.sum(-1) <= 0)):
+                raise ValueError("assignments must be finite, nonnegative and have positive row sums")
+            responsibilities = responsibilities / responsibilities.sum(-1, keepdim=True)
+        global_rate = sample_x.sum(0) / sample_sf.sum().clamp_min(1e-8)
+        numerators = responsibilities.T @ sample_x + prior_exposure * global_rate[None]
+        denominators = responsibilities.T @ sample_sf + prior_exposure
+        rate = (numerators / denominators[:, None]).clamp_min(1e-7)
+        self.log_component_mean.copy_(rate.log())
+        mixture_probs = (responsibilities.sum(0) + 1.0) / (len(ids) + self.dim)
+        if gate_from_assignments:
+            self.mixture_logits.weight.zero_()
+            self.mixture_logits.bias.copy_(mixture_probs.log())
+        # Set classifier directions near data-driven centers without large logits.
+        directions = features.new_zeros((self.dim, self.dim_genes))
+        for k in range(self.dim):
+            weight = responsibilities[:, k].sum()
+            directions[k] = (responsibilities[:, k, None] * features).sum(0) / weight.clamp_min(1.0)
+        directions -= directions.mean(0, keepdim=True)
+        directions /= directions.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        self.encoder_classifier.weight.copy_(directions * 0.1)
+        self.encoder_classifier.bias.copy_(mixture_probs.log())
+        return {"cells_used": int(len(ids)), "component_probs": mixture_probs.cpu().tolist(),
+                "method": "supplied_responsibilities" if assignments is not None else "kmeans"}
+
+    @torch.no_grad()
+    def sample_counts(self, latent: Tensor, size_factors: Tensor, library_ids: Tensor) -> Tensor:
+        """Sample raw-like UMI counts for given patient/cell covariates."""
+        if size_factors.ndim != 2 or size_factors.shape[0] != latent.shape[0]:
+            raise ValueError("size_factors must be [patients,cells]")
+        if library_ids.shape != size_factors.shape:
+            raise ValueError("library_ids must match size_factors")
+        if (torch.any(library_ids < 0) or torch.any(library_ids >= self.n_libraries)
+                or torch.any(library_ids != library_ids.long())):
+            raise ValueError("library_ids must be integers in the configured library range")
+        if not torch.all(torch.isfinite(size_factors)) or torch.any(size_factors <= 0):
+            raise ValueError("size_factors must be finite and strictly positive")
+        gate = self.prior_gate_probs(latent)
+        n, c = size_factors.shape
+        choices = torch.multinomial(gate, c, replacement=True)
+        effect = self.batch_effects()[library_ids.long()]
+        log_mu = size_factors.log()[..., None] + self.log_component_mean[choices] + effect
+        mu = log_mu.clamp(-18, 18).exp()
+        theta = self.dispersion()
+        rate = torch.distributions.Gamma(theta, theta / mu).sample()
+        sampled = torch.poisson(rate)
+        logits = self.inflation_logits()
+        if logits is not None:
+            p = torch.sigmoid(logits[choices])
+            sampled = sampled.masked_fill(torch.rand_like(p) < p, 0.)
+        return sampled
+
 def build_head(config: Mapping[str, Any], dim_latent: int) -> BaseHead:
     """Build a head from an archived-style configuration dictionary."""
     values = copy.deepcopy(dict(config))
@@ -661,6 +1024,7 @@ def build_head(config: Mapping[str, Any], dim_latent: int) -> BaseHead:
         "MultiNormal": MultiNormalHead,
         "GMM": GMMHead,
         "TopicModel": TopicModelHead,
+        "ZINBMixture": ZINBMixtureHead,
     }
     try:
         cls = mapping[head_type]

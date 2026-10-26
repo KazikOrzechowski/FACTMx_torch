@@ -127,17 +127,16 @@ def encoder_gradient_norm_pair(
     if not params:
         return 0.0, 0.0
 
-    g_simple = torch.autograd.grad(
-        simple_loss,
-        params,
-        retain_graph=True,
-        allow_unused=True,
+    # A model with only structured (or only simple) heads has an exactly
+    # constant zero loss in the absent group. Such a value has no grad_fn;
+    # allow_unused=True alone does not make autograd.grad accept it.
+    g_simple = (
+        torch.autograd.grad(simple_loss, params, retain_graph=True, allow_unused=True)
+        if simple_loss.requires_grad else (None,) * len(params)
     )
-    g_structured = torch.autograd.grad(
-        structured_loss,
-        params,
-        retain_graph=True,
-        allow_unused=True,
+    g_structured = (
+        torch.autograd.grad(structured_loss, params, retain_graph=True, allow_unused=True)
+        if structured_loss.requires_grad else (None,) * len(params)
     )
 
     simple_ss: Tensor | None = None
