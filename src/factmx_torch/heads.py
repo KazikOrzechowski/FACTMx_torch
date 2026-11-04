@@ -128,6 +128,192 @@ class MultinomialHead(BaseHead):
         return torch.stack(samples)
 
 
+class _TrainingFrequencyMultinomialHead(MultinomialHead):
+    """Experimental CNA encoder backed by **train-only** per-position frequencies.
+
+    This subclass retains MultinomialHead.decoder, decode_params, loss, and decode
+    *unchanged*. The only modification is the patient-to-encoder summary.
+
+    `fit_category_frequencies` MUST be called on observed training patients
+    before encoding any data, including checkpoint-validation patients. Fitted
+    frequencies and the fitted marker are persistent state_dict buffers.
+    """
+
+    def __init__(
+        self,
+        dim_pos: int,
+        dim_cat: int,
+        dim: int,
+        dim_latent: int,
+        head_name: str,
+        *,
+        eps: float = 1e-3,
+        encode_logits: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if encode_logits not in (None, False):
+            raise ValueError(
+                "Experimental CNA heads replace log-one-hot encoding; "
+                "do not set encode_logits=True"
+            )
+        if int(dim) != int(dim_pos) * int(dim_cat):
+            raise ValueError("dim must equal dim_pos * dim_cat")
+        super().__init__(
+            dim_pos=dim_pos,
+            dim_cat=dim_cat,
+            dim=dim,
+            dim_latent=dim_latent,
+            head_name=head_name,
+            eps=eps,
+            encode_logits=False,
+            **kwargs,
+        )
+        self.register_buffer(
+            "category_frequencies",
+            torch.full((self.dim_pos, self.dim_cat), 1.0 / self.dim_cat),
+        )
+        self.register_buffer(
+            "category_frequencies_fitted", torch.tensor(False, dtype=torch.bool)
+        )
+        self.register_buffer(
+            "empty_training_positions", torch.tensor(0, dtype=torch.long)
+        )
+
+    def fit_category_frequencies(
+        self,
+        data: tuple[Tensor, Tensor],
+        *,
+        patient_mask: Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Fit frequencies from observed *training* patients only.
+
+        `data`: (nonnegative counts [N,P,K], trials [N,P]). CNA one-hot
+        values with trials=1 are typical. For counts>1 this estimates the
+        empirical category frequency over all observed trials per position.
+        `patient_mask` selects training patients with this view observed; this
+        prevents placeholder rows from entering the frequency estimates.
+        Positions with no observed trials use a uniform reference and are
+        reported explicitly. Fitting does not draw random numbers.
+        """
+        observations, counts = data
+        if observations.ndim != 3 or tuple(observations.shape[1:]) != (
+            self.dim_pos, self.dim_cat
+        ):
+            raise ValueError(
+                f"Expected CNA observations [N,{self.dim_pos},{self.dim_cat}], "
+                f"got {tuple(observations.shape)}"
+            )
+        if tuple(counts.shape) != tuple(observations.shape[:2]):
+            raise ValueError("CNA trial counts must be [N,positions]")
+        if observations.shape[0] < 1:
+            raise ValueError("At least one training patient is required")
+        if patient_mask is not None:
+            mask = torch.as_tensor(patient_mask, dtype=torch.bool, device=observations.device)
+            if mask.shape != (observations.shape[0],):
+                raise ValueError("patient_mask must have shape [N]")
+            observations, counts = observations[mask], counts[mask]
+            if observations.shape[0] < 1:
+                raise ValueError("No observed training patients selected")
+        if not bool(torch.isfinite(observations).all() and torch.isfinite(counts).all()):
+            raise ValueError("CNA training counts must be finite")
+        if bool((observations < 0).any() or (counts < 0).any()):
+            raise ValueError("CNA training counts must be nonnegative")
+        if not bool(torch.allclose(observations.sum(-1), counts, rtol=1e-4, atol=1e-4)):
+            raise ValueError("CNA category counts do not sum to per-position trials")
+        with torch.no_grad():
+            sums = observations.to(dtype=torch.float64).sum(dim=0)
+            trials = counts.to(dtype=torch.float64).sum(dim=0)
+            freq = sums / trials.clamp_min(1.0).unsqueeze(-1)
+            empty = trials == 0
+            if bool(empty.any()):
+                freq[empty] = 1.0 / float(self.dim_cat)
+            self.category_frequencies.copy_(
+                freq.to(device=self.category_frequencies.device, dtype=self.category_frequencies.dtype)
+            )
+            self.category_frequencies_fitted.fill_(True)
+            self.empty_training_positions.fill_(int(empty.sum().item()))
+        return {
+            "n_training_patients_observed": int(observations.shape[0]),
+            "n_positions": self.dim_pos,
+            "n_categories": self.dim_cat,
+            "empty_training_positions": int(empty.sum().item()),
+            "min_frequency": float(freq.min().item()),
+            "max_frequency": float(freq.max().item()),
+        }
+
+    def _normalized_cna(self, data: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+        if not bool(self.category_frequencies_fitted.item()):
+            raise RuntimeError(
+                f"{type(self).__name__} requires fit_category_frequencies(...) "
+                "on the training cohort before encode()"
+            )
+        observations, counts = data
+        if observations.ndim != 3 or tuple(observations.shape[1:]) != (
+            self.dim_pos, self.dim_cat
+        ) or tuple(counts.shape) != tuple(observations.shape[:2]):
+            raise ValueError("CNA observations/counts have an unexpected shape")
+        if not bool(torch.isfinite(observations).all() and torch.isfinite(counts).all()):
+            raise ValueError("Non-finite CNA observations")
+        if bool((counts < 0).any() or (observations < 0).any()):
+            raise ValueError("CNA counts must be nonnegative")
+        values = observations / counts.unsqueeze(-1).clamp_min(1.0)
+        return values, counts > 0
+
+    def _frequency_scale(self, freq: Tensor) -> Tensor:
+        return torch.ones_like(freq)
+
+    def encode(
+        self, data: tuple[Tensor, Tensor], deterministic: bool = False
+    ) -> dict[str, Tensor]:
+        values, present = self._normalized_cna(data)
+        freq = self.category_frequencies.to(device=values.device, dtype=values.dtype)
+        centered = (values - freq) / self._frequency_scale(freq)
+        # A position with zero observed trials should not impersonate a deletion
+        # or an amplification. Missing patient/view masking remains upstream.
+        centered = torch.where(present.unsqueeze(-1), centered, torch.zeros_like(centered))
+        return {"encoder_input": centered.reshape(values.shape[0], -1)}
+
+
+class CenteredOneHotMultinomialHead(_TrainingFrequencyMultinomialHead):
+    """Experimental head: CNA encoder `(one_hot - training_frequency)`.
+
+    No change to the categorical decoder or reconstruction objective.
+    Training frequencies are estimated by `fit_category_frequencies`.
+    """
+
+    head_type = "MultinomialCenteredOneHot"
+
+
+class FrequencyStandardizedMultinomialHead(_TrainingFrequencyMultinomialHead):
+    """Experimental head: `(one_hot - p) / sqrt(p*(1-p) + floor)`.
+
+    `variance_floor` prevents a rare or absent category from causing a huge
+    input magnitude; `max_inverse_std` optionally provides a stricter cap.
+    Both settings are fixed hyperparameters, not learned frequencies.
+    """
+
+    head_type = "MultinomialFrequencyStandardized"
+
+    def __init__(
+        self,
+        *args: Any,
+        variance_floor: float = 0.01,
+        max_inverse_std: float = 10.0,
+        **kwargs: Any,
+    ) -> None:
+        if not math.isfinite(variance_floor) or variance_floor <= 0:
+            raise ValueError("variance_floor must be finite and positive")
+        if not math.isfinite(max_inverse_std) or max_inverse_std <= 0:
+            raise ValueError("max_inverse_std must be finite and positive")
+        super().__init__(*args, **kwargs)
+        self.variance_floor = float(variance_floor)
+        self.max_inverse_std = float(max_inverse_std)
+
+    def _frequency_scale(self, freq: Tensor) -> Tensor:
+        inverse_sd = torch.rsqrt(freq * (1.0 - freq) + self.variance_floor)
+        return torch.reciprocal(inverse_sd.clamp(max=self.max_inverse_std))
+
+
 class MultiNormalHead(BaseHead):
     head_type = "MultiNormal"
 
@@ -1021,6 +1207,8 @@ def build_head(config: Mapping[str, Any], dim_latent: int) -> BaseHead:
     mapping = {
         "Bernoulli": BernoulliHead,
         "Multinomial": MultinomialHead,
+        "MultinomialCenteredOneHot": CenteredOneHotMultinomialHead,
+        "MultinomialFrequencyStandardized": FrequencyStandardizedMultinomialHead,
         "MultiNormal": MultiNormalHead,
         "GMM": GMMHead,
         "TopicModel": TopicModelHead,

@@ -215,3 +215,13 @@ Citation metadata is provided in [`CITATION.cff`](CITATION.cff). Update the auth
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+
+## Experimental CNA encoder ablations (0.1.4.dev1)
+
+For TCGA CNA five-state multinomial heads, `MultinomialCenteredOneHot`
+and `MultinomialFrequencyStandardized` provide two *encoder-only* alternatives
+with identical multinomial decoders and reconstruction likelihood. Both require
+explicit train-only `fit_category_frequencies` before inference. The original
+`Multinomial` remains unchanged. See
+[docs/experimental_cna_encodings.md](docs/experimental_cna_encodings.md).
