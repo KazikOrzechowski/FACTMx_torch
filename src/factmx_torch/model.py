@@ -163,6 +163,8 @@ class FACTMxModel(nn.Module):
         simple_head_names: Sequence[str] | None = None,
         active_head_names: Sequence[str] | None = None,
         ridge_alpha: float = 1e-4,
+        gate_weight_mode: str = "zero",
+        gate_bias_mode: str = "population",
     ) -> dict[str, Any]:
         """Apply the recommended train-only global-covariance warm start.
 
@@ -170,7 +172,8 @@ class FACTMxModel(nn.Module):
         block-balances them, initializes the shared linear latent-mean map from
         whitened global covariance directions, ridge-initializes compatible
         simple decoders, and initializes structured gates with zero latent slopes
-        plus population-logit biases.
+        plus population-logit biases by default. Pass ``gate_weight_mode``
+        and ``gate_bias_mode`` to control these independently.
 
         Explicit ``population_gate_probs`` are used when supplied.  Otherwise
         structured population proportions are estimated from deterministic local
@@ -185,6 +188,8 @@ class FACTMxModel(nn.Module):
             simple_head_names=simple_head_names,
             active_head_names=active_head_names,
             ridge_alpha=ridge_alpha,
+            gate_weight_mode=gate_weight_mode,
+            gate_bias_mode=gate_bias_mode,
         )
 
     def fit(
@@ -250,6 +255,8 @@ class FACTMxModel(nn.Module):
         balance_target_gradient_ratio: float = 1.0,
         initialization: str | None = "global_covariance",
         initialization_ridge_alpha: float = 1e-4,
+        gate_weight_mode: str = "zero",
+        gate_bias_mode: str = "population",
         population_gate_probs: Mapping[str, Any] | None = None,
         simple_head_names: Sequence[str] | None = None,
         active_head_names: Sequence[str] | None = None,
@@ -283,6 +290,8 @@ class FACTMxModel(nn.Module):
                     simple_head_names=simple_head_names,
                     active_head_names=active_head_names,
                     ridge_alpha=float(initialization_ridge_alpha),
+                    gate_weight_mode=gate_weight_mode,
+                    gate_bias_mode=gate_bias_mode,
                 )
         elif init_mode not in {"none", "legacy", "preserve"}:
             raise ValueError(

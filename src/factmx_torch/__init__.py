@@ -13,7 +13,7 @@ from .heads import (
     ZINBMixtureHead,
     build_head,
 )
-from .initialization import initialize_global_covariance
+from .initialization import initialize_global_covariance, initialize_masked_global_covariance
 from .missing_view import MissingViewFACTMx
 from .model import FACTMxModel
 from .training import (
@@ -31,6 +31,7 @@ __all__ = [
     "FACTMxModel",
     "MissingViewFACTMx",
     "initialize_global_covariance",
+    "initialize_masked_global_covariance",
     "BaseHead",
     "BernoulliHead",
     "MultinomialHead",

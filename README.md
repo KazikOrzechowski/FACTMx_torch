@@ -58,6 +58,25 @@ Full details, identifiability warnings, input preparation, and examples are in
 [`docs/zinb_mixture.md`](docs/zinb_mixture.md) and
 [`examples/zinb_mixture_training.py`](examples/zinb_mixture_training.py).
 
+## New in 0.1.3: mask-aware covariance initialization and independent gate policies
+
+The new package-level `initialize_masked_global_covariance` API matches the
+train-only TCGA/IMMUCAN external masked adapter, including observed-view block
+balancing, numerical rank/whitening safeguards, observed-only Gaussian ridge
+initialization, and correction for neutral encoder centers. The same procedure
+is available as `MissingViewFACTMx.initialize_masked_global_covariance(...)`.
+
+Structured gate weights (`gate_weight_mode='zero'` or `'preserve_random'`) and
+biases (`gate_bias_mode='population'` or `'zero'`) can be chosen **independently**.
+The complete-data `initialize_global_covariance`, `FACTMxModel.initialize_global_covariance`,
+and `FACTMxModel.fit_optimized` also support these parameters. Defaults are
+backward compatible with 0.1.2 (`zero` weights / `population` biases).
+
+See [docs/masked_global_initialization.md](docs/masked_global_initialization.md)
+for reproducible usage and migration instructions. The package remains PyTorch-only;
+training-cohort extraction, independent Topic/GMM fitting, and seed setup remain
+with the calling workflow.
+
 ## Default global-covariance initialization
 
 `FACTMxModel.fit_optimized()` now applies a train-only block-balanced global-covariance warm start by default. It initializes the shared linear latent map from whitened covariance directions, ridge-initializes compatible continuous simple-view decoders, and starts structured latent-to-gate maps at zero slope with population-logit biases. Pass explicit `population_gate_probs` when independent GMM/topic weights are available; otherwise population proportions are estimated from deterministic local assignments. Use `initialization="legacy"` (or `None`) to preserve the historical parameter initialization. See `docs/global_covariance_initialization.md`.

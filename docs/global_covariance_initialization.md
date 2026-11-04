@@ -11,8 +11,8 @@ For a fitted set of view-local encoders/components, the initializer:
 4. writes the resulting affine transform into the shared linear latent-mean encoder;
 5. initializes linear Gaussian/simple decoders by train-only ridge regression from
    the initialized latent scores;
-6. initializes each structured latent-to-gate slope to zero and its bias to the
-   population mixture proportions.
+6. initializes structured gate slopes and biases using independently configurable
+   policies (by default, zero slopes and population mixture-logit biases).
 
 No labels, simulator truth, validation observations, or test observations enter
 this initializer.  A zero latent-to-gate slope does **not** freeze the gate map:
@@ -43,3 +43,20 @@ proportions are estimated from the current deterministic local assignments on th
 supplied training observations.  In the simulation benchmark, the independently
 fitted GMM/Topic mixture weights are passed explicitly because that is the
 validated warm-start configuration.
+
+## Independent gate initialization policies (v0.1.3)
+
+```python
+info = model.initialize_global_covariance(
+    training_data,
+    population_gate_probs={"gmm": gmm_weights},
+    gate_weight_mode="preserve_random",  # or "zero"
+    gate_bias_mode="zero",              # or "population"
+)
+```
+
+The same two parameters can be passed to `fit_optimized()` when it runs the
+complete-data covariance initializer. `preserve_random` does *not* sample new
+weights; the caller should initialize the gate weights to the desired small
+random distribution before invoking the initializer. For masked data, use
+`initialize_masked_global_covariance`; see `masked_global_initialization.md`.

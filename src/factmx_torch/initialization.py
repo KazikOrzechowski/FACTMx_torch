@@ -11,6 +11,18 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+# The masked initializer lives in its own module to preserve the complete-data
+# initializer as a backward-compatible, independently tested entry point.
+from .masked_initialization import initialize_masked_global_covariance
+
+
+def _validate_gate_modes(gate_weight_mode: str, gate_bias_mode: str) -> None:
+    if gate_weight_mode not in {"zero", "preserve_random"}:
+        raise ValueError(f"Unknown gate_weight_mode: {gate_weight_mode!r}")
+    if gate_bias_mode not in {"population", "zero"}:
+        raise ValueError(f"Unknown gate_bias_mode: {gate_bias_mode!r}")
+
+
 
 def _as_probability_vector(value: Any, *, device: torch.device) -> Tensor:
     probs = torch.as_tensor(value, dtype=torch.float64, device=device).reshape(-1)
@@ -67,6 +79,8 @@ def initialize_global_covariance(
     active_head_names: Sequence[str] | None = None,
     ridge_alpha: float = 1e-4,
     eps: float = 1e-8,
+    gate_weight_mode: str = "zero",
+    gate_bias_mode: str = "population",
 ) -> dict[str, Any]:
     """Initialize FACTMx from train-only global covariance structure.
 
@@ -77,17 +91,24 @@ def initialize_global_covariance(
     3. take the leading global covariance/PCA directions and whiten their scores;
     4. write that affine transform into the shared linear latent-mean encoder;
     5. moment-match Gaussian/simple linear decoders by ridge regression;
-    6. initialize structured latent-to-gate slopes to zero and gate biases to
-       population mixture proportions.
+    6. initialize structured latent-to-gate weights and biases according to
+       the independent ``gate_weight_mode`` and ``gate_bias_mode`` policies.
 
     ``population_gate_probs`` is optional.  When omitted for a structured head,
     the population gate is estimated from that head's deterministic local
     assignments on the supplied training data.  For the benchmark, passing the
     independent GMM/Topic mixture weights reproduces the validated initializer.
 
+    Gate policies are independent: ``gate_weight_mode='zero'`` clears the gate
+    slopes and ``'preserve_random'`` keeps the existing random initialization
+    (no additional RNG consumption). ``gate_bias_mode='population'`` uses
+    population log proportions; ``'zero'`` selects uniform logits. The default
+    ``('zero', 'population')`` reproduces FACTMx v0.1.2 exactly.
+
     Only :class:`~factmx_torch.encoders.LinearEncoder`-style encoders exposing
     ``encoder.loc`` are supported because the covariance map is affine by design.
     """
+    _validate_gate_modes(gate_weight_mode, gate_bias_mode)
     if ridge_alpha < 0:
         raise ValueError("ridge_alpha must be non-negative")
     if eps <= 0:
@@ -211,26 +232,38 @@ def initialize_global_covariance(
         if not bool(getattr(head, "structured", False)) or not hasattr(head, "mixture_logits"):
             continue
         name = str(head.head_name)
-        if name in supplied:
+        if gate_bias_mode == "zero":
+            # No mixture-prior estimate is needed to initialize a zero bias.
+            # This differs from the old mandatory inference only for this new mode.
+            logits = None
+            gate_sources[name] = "uniform_zero_legacy"
+        elif name in supplied:
             probs = _as_probability_vector(supplied[name], device=balanced.device)
             gate_sources[name] = "supplied"
+            logits = probs.clamp_min(1e-12).log()
         else:
             inferred = _infer_population_gate(encoded, int(head.dim))
             if inferred is None:
                 continue
             probs = inferred.to(device=balanced.device)
             gate_sources[name] = "local_assignment_mean"
-        if probs.numel() != int(head.dim):
-            raise ValueError(
-                f"Population gate for {name!r} has {probs.numel()} entries; expected {head.dim}"
-            )
-        logits = probs.clamp_min(1e-12).log()
-        logits = logits - logits.mean()
+            logits = probs.clamp_min(1e-12).log()
+        if logits is not None:
+            if logits.numel() != int(head.dim):
+                raise ValueError(
+                    f"Population gate for {name!r} has {logits.numel()} entries; expected {head.dim}"
+                )
+            logits = logits - logits.mean()
         with torch.no_grad():
-            head.mixture_logits.weight.zero_()
-            head.mixture_logits.bias.copy_(
-                logits.to(dtype=head.mixture_logits.bias.dtype, device=head.mixture_logits.bias.device)
-            )
+            if gate_weight_mode == "zero":
+                head.mixture_logits.weight.zero_()
+            if gate_bias_mode == "zero":
+                head.mixture_logits.bias.zero_()
+            else:
+                assert logits is not None
+                head.mixture_logits.bias.copy_(
+                    logits.to(dtype=head.mixture_logits.bias.dtype, device=head.mixture_logits.bias.device)
+                )
 
     info = {
         "method": "global_covariance",
@@ -240,6 +273,8 @@ def initialize_global_covariance(
         "latent_score_sd": [float(value) for value in score_sd.detach().cpu()],
         "ridge_alpha": float(ridge_alpha),
         "gate_sources": gate_sources,
+        "gate_weight_mode": gate_weight_mode,
+        "gate_bias_mode": gate_bias_mode,
     }
     setattr(model, "_global_covariance_initialized", True)
     setattr(model, "_initialization_info", info)

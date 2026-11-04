@@ -99,6 +99,39 @@ class MissingViewFACTMx(FACTMxModel):
         else:
             self.register_parameter("missing_scale_raw", None)
 
+    def initialize_masked_global_covariance(
+        self,
+        summaries: Sequence[Any],
+        availability: Any,
+        *,
+        simple_targets: Mapping[str, Any] | None = None,
+        population_gate_probs: Mapping[str, Any] | None = None,
+        ridge_alpha: float = 1e-4,
+        min_relative_singular: float = 1e-5,
+        max_whitening_gain: float = 100.0,
+        gate_weight_mode: str = "zero",
+        gate_bias_mode: str = "population",
+    ) -> dict[str, Any]:
+        """Initialize from aligned training-only per-view summaries and masks.
+
+        See :func:`factmx_torch.initialize_masked_global_covariance` for
+        details. Initialize neutral centers from training patients first.
+        """
+        from .masked_initialization import initialize_masked_global_covariance
+
+        return initialize_masked_global_covariance(
+            self,
+            summaries,
+            availability,
+            simple_targets=simple_targets,
+            population_gate_probs=population_gate_probs,
+            ridge_alpha=ridge_alpha,
+            min_relative_singular=min_relative_singular,
+            max_whitening_gain=max_whitening_gain,
+            gate_weight_mode=gate_weight_mode,
+            gate_bias_mode=gate_bias_mode,
+        )
+
     def _checkpoint_config(self) -> dict[str, Any]:
         config = super()._checkpoint_config()
         config.update(
