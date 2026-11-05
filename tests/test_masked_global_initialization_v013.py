@@ -184,4 +184,4 @@ def test_complete_data_gate_modes_and_fit_api():
 
 
 def test_version():
-    assert __version__ == '0.1.4.dev1'
+    assert __version__ == '0.1.4.dev1+gradnorm.1'

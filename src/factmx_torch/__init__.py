@@ -18,6 +18,7 @@ from .heads import (
 from .initialization import initialize_global_covariance, initialize_masked_global_covariance
 from .missing_view import MissingViewFACTMx
 from .model import FACTMxModel
+from .gradnorm import MolecularGradNorm
 from .training import (
     EncoderGradientBalancer,
     StructuredFirstBalanceConfig,
@@ -49,6 +50,7 @@ __all__ = [
     "MeanEncoder",
     "AttentionEncoder",
     "build_encoder",
+    "MolecularGradNorm",
     "EncoderGradientBalancer",
     "StructuredFirstBalanceConfig",
     "combine_partitioned_objective",

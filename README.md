@@ -225,3 +225,12 @@ with identical multinomial decoders and reconstruction likelihood. Both require
 explicit train-only `fit_category_frequencies` before inference. The original
 `Multinomial` remains unchanged. See
 [docs/experimental_cna_encodings.md](docs/experimental_cna_encodings.md).
+
+## Research patch: molecular GradNorm on three TCGA simple views
+
+This local-version branch (`0.1.4.dev1+gradnorm.1`) adds the optional
+`factmx_torch.MolecularGradNorm` controller. It does **not** turn GradNorm on
+inside default `FACTMxModel.fit_optimized`; the matched TCGA runner opts in with
+`--simple-balancing gradnorm`. See the standalone `README_GRADNORM.md` bundled
+in the integration release for train-only CV, missing-view, checkpoint and
+Gaussian NLL caveats.
